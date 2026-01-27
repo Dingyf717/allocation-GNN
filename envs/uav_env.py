@@ -58,7 +58,7 @@ class UAVEnv(gym.Env):
             # 确保总需求略小于或等于总UAV数，或者允许溢出
             demands = {}
             for t_id in scen['type_ids']:
-                demands[t_id] = np.random.randint(1, 10)  # 随机需求量
+                demands[t_id] = np.random.randint(3, 4)  # 随机需求量
 
             tgt = Target(id=i, pos=pos)
             tgt.reset(demands)
@@ -110,6 +110,8 @@ class UAVEnv(gym.Env):
         # 计算奖励
         reward = calc_reward(uav, target, action)
 
+        info = {}  # 初始化 info
+
         # 执行状态更新
         if action == 1:
             needed, _ = target.get_demand_status(uav.uav_type)
@@ -120,15 +122,26 @@ class UAVEnv(gym.Env):
                 uav.assigned_target_id = target.id
                 uav.available = False
 
+                # 【新增】标记这是一个有效分配
+                info['is_valid_action'] = True
+
+                # 【修复 2】计算并返回角度得分，让 main_train.py 能统计到 Ang
+                # 需要调用 mechanics 中的函数
+                current_angle_score = calc_angle_score(uav.velocity, uav.pos, target.pos)
+                info['angle_score'] = current_angle_score
+
                 # 成功分配后，跳到下一个 UAV
                 self.uav_idx += 1
                 self.target_idx = 0
             else:
                 # 惩罚性操作：虽然选了 Assign 但无效
                 # 逻辑流转：视为被迫 Skip，看下一个 Target
+                info['is_valid_action'] = False
+                info['angle_score'] = 0.0  # 无效分配没有角度分
                 self.target_idx += 1
         else:
             # Skip
+            info['is_valid_action'] = False
             self.target_idx += 1
 
         # 边界检查
@@ -137,7 +150,6 @@ class UAVEnv(gym.Env):
             self.target_idx = 0
 
         done = (self.uav_idx >= len(self.uavs))
-        info = {}
 
         # 获取下一个状态
         obs = self._get_obs()

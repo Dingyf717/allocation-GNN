@@ -46,9 +46,12 @@ class Config:
         """
         # 训练时随机范围 (增强泛化性)
         # 这里的范围决定了模型训练时的"题目难度"
-        if num_uavs is None: num_uavs = np.random.randint(50, 80)
-        if num_targets is None: num_targets = np.random.randint(3, 6)
-        if num_types is None: num_types = np.random.randint(3, 5)  # 比如 3-5 种类型
+        if num_uavs is None: num_uavs = (
+            np.random.randint(30, 50))
+        if num_targets is None:
+            num_targets = np.random.randint(3, 4)
+        if num_types is None:
+            num_types = np.random.randint(2, 4)
 
         return {
             "n_uavs": num_uavs,
