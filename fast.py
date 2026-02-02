@@ -4,6 +4,7 @@ import time
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.optimize import linear_sum_assignment
 
 # 解决 OpenMP 冲突
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
