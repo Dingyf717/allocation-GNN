@@ -52,7 +52,7 @@ class Config:
         随机生成场景配置
         不再需要生成 'type_ids' 列表，因为现在兵种是固定的三种功能
         """
-        if num_uavs is None: num_uavs = np.random.randint(20, 40)
+        if num_uavs is None: num_uavs = np.random.randint(40, 70)
         if num_targets is None: num_targets = np.random.randint(3, 8)
 
         return {

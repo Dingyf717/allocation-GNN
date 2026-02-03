@@ -33,6 +33,79 @@ class PPOAgent:
 
         self.mse_loss = nn.MSELoss()
 
+    def select_greedy_action(self, state, mode='sequential'):
+        """
+        GNN 输出 -> 贪婪决策
+        mode: 'simple' (直接取最大) | 'sequential' (带约束的序列分配)
+        """
+        # 1. 准备数据
+        uav_t = torch.FloatTensor(state['uavs']).unsqueeze(0).to(self.device)
+        tgt_t = torch.FloatTensor(state['targets']).unsqueeze(0).to(self.device)
+        edge_t = torch.FloatTensor(state['edges']).unsqueeze(0).to(self.device)
+
+        # 2. 获取 GNN 评分 (1, N, M+1)
+        with torch.no_grad():
+            logits = self.policy.get_logits(uav_t, tgt_t, edge_t)
+            logits = logits.squeeze(0)  # (N_UAV, M_Target+1)
+
+        n_uav, n_total_opts = logits.shape
+        n_targets = n_total_opts - 1
+
+        # 获取 UAV 类型 (用于约束判断)
+        # state['uavs'] 是 (N, 7)，最后3位是one-hot类型
+        # [..., is_decoy, is_strike, is_assess]
+        uav_types = np.argmax(state['uavs'][:, -3:], axis=1)  # 0:Decoy, 1:Strike, 2:Assess
+
+        if mode == 'simple':
+            # --- 方案 A: 简单贪婪 (每个 UAV 选自己最喜欢的) ---
+            actions = torch.argmax(logits, dim=1).cpu().numpy()
+            return actions
+
+        elif mode == 'sequential':
+            # --- 方案 B: 带约束的序列贪婪 (推荐) ---
+            actions = np.zeros(n_uav, dtype=int)
+
+            # 记录每个目标已分配的各兵种数量
+            # allocations[tgt_id][type_id] = count
+            allocations = {j: {0: 0, 1: 0, 2: 0} for j in range(n_targets)}
+
+            # 设定约束阈值 (根据你的公式计算得出)
+            # 例如: 每个目标最多 5个诱饵, 3个打击, 1个评估
+            MAX_CAPACITY = {
+                0: 5,  # Decoy Cap
+                1: 3,  # Strike Cap
+                2: 1  # Assess Cap
+            }
+
+            # 这里的 mask 是动态的，用来屏蔽已饱和的目标
+            # logits 维度: [N_UAV, 1 + N_Targets] (索引0是Loiter)
+
+            # 为了更好的效果，我们可以先让“更有把握”的 UAV 先选
+            # 计算每个 UAV 对其最优目标的“自信度” (Max Logit)
+            confidence, _ = torch.max(logits, dim=1)
+            sorted_uav_indices = torch.argsort(confidence, descending=True).cpu().numpy()
+
+            for i in sorted_uav_indices:
+                u_type = uav_types[i]
+                current_scores = logits[i].clone()  # (M+1, )
+
+                # 检查所有目标，如果某目标对当前兵种已饱和，则屏蔽该目标
+                for t_id in range(n_targets):
+                    if allocations[t_id][u_type] >= MAX_CAPACITY[u_type]:
+                        # 屏蔽: 把分数设为极小值 (注意 t_id+1 因为索引0是Loiter)
+                        current_scores[t_id + 1] = -1e9
+
+                # 做出选择
+                choice = torch.argmax(current_scores).item()
+                actions[i] = choice
+
+                # 如果选的不是 Loiter (0)，则更新计数
+                if choice > 0:
+                    real_tgt_id = choice - 1
+                    allocations[real_tgt_id][u_type] += 1
+
+            return actions
+
     def select_action(self, state):
         """
         输入 state 是 Dict: {'uavs':..., 'targets':..., 'edges':...}

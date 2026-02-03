@@ -40,7 +40,11 @@ class UAVEnv(gym.Env):
             pos = np.random.rand(2) * cfg.MAP_WIDTH
             angle = np.random.uniform(0, 2 * np.pi)
             vel = np.array([np.cos(angle), np.sin(angle)]) * 15.0
-            u_type = np.random.choice([cfg.TYPE_DECOY, cfg.TYPE_STRIKE, cfg.TYPE_ASSESS])
+            u_type = np.random.choice(
+                        [cfg.TYPE_DECOY, cfg.TYPE_STRIKE, cfg.TYPE_ASSESS],
+                        p=[0.45, 0.40, 0.15]  # 调整概率分布
+            )
+
 
             uav = UAV(id=i, pos=pos)
             uav.reset(pos, vel, u_type)
