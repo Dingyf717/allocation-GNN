@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import BatchSampler, SubsetRandomSampler
-from torch.nn.utils.rnn import pad_sequence
 import numpy as np
 
 from configs.config import cfg
@@ -14,70 +13,47 @@ class PPOAgent:
     def __init__(self):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # 1. 初始化 Deep Scheme 网络
         self.policy = DeepAllocationNet().to(self.device)
-
-        # 分组优化器参数 (保持与 Config 一致)
-        self.optimizer = optim.Adam([
-            {'params': self.policy.uav_embedding.parameters(), 'lr': cfg.LR_ACTOR},
-            {'params': self.policy.uav_encoder.parameters(), 'lr': cfg.LR_ACTOR},
-            {'params': self.policy.target_embedding.parameters(), 'lr': cfg.LR_ACTOR},
-            {'params': self.policy.skip_token, 'lr': cfg.LR_ACTOR},
-            {'params': self.policy.critic_head.parameters(), 'lr': cfg.LR_CRITIC},
-        ])
+        self.optimizer = optim.Adam(self.policy.parameters(), lr=cfg.LR_ACTOR)
 
         self.policy_old = DeepAllocationNet().to(self.device)
         self.policy_old.load_state_dict(self.policy.state_dict())
 
-        # 2. 修改 Buffer 结构: 分离 UAV 和 Target 状态
+        # Buffer 增加 edge_features
         self.buffer = {
-            'uav_states': [],  # List of Tensor (N, D_u)
-            'target_states': [],  # List of Tensor (M, D_t)
-            'actions': [],  # List of Tensor (N,)
-            'logprobs': [],  # List of Tensor (N,)
-            'rewards': [],  # List of float (Global Scalar Reward)
-            'is_terminals': [],  # List of bool
-            'values': []  # List of Tensor (1,)
+            'uav_states': [],  # List of (N, 7)
+            'target_states': [],  # List of (M, 4)
+            'edge_features': [],  # List of (N, M, 2)
+            'actions': [],  # List of (N,)
+            'logprobs': [],
+            'rewards': [],
+            'is_terminals': [],
+            'values': []
         }
 
         self.mse_loss = nn.MSELoss()
 
     def select_action(self, state):
         """
-        One-Shot 动作选择
-        State: Tuple (uav_matrix, target_matrix)
+        输入 state 是 Dict: {'uavs':..., 'targets':..., 'edges':...}
         """
-        uav_mat, tgt_mat = state
-
-        # 转 Tensor (增加 Batch 维度 B=1)
-        uav_t = torch.FloatTensor(uav_mat).unsqueeze(0).to(self.device)  # (1, N, D_u)
-        tgt_t = torch.FloatTensor(tgt_mat).unsqueeze(0).to(self.device)  # (1, M, D_t)
+        # 转 Tensor 并增加 Batch 维度 (1, ...)
+        uav_t = torch.FloatTensor(state['uavs']).unsqueeze(0).to(self.device)
+        tgt_t = torch.FloatTensor(state['targets']).unsqueeze(0).to(self.device)
+        edge_t = torch.FloatTensor(state['edges']).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
-            # 获取全局动作
-            action, log_prob, value, _ = self.policy_old.get_action(uav_t, tgt_t)
+            # 传入三个参数
+            action, log_prob, value, _ = self.policy_old.get_action(uav_t, tgt_t, edge_t)
 
-        # 存入 Buffer (移除 Batch 维度，存原始数据)
-        self.buffer['uav_states'].append(torch.FloatTensor(uav_mat))
-        self.buffer['target_states'].append(torch.FloatTensor(tgt_mat))
-        self.buffer['actions'].append(action.squeeze(0).cpu())  # (N,)
-        self.buffer['logprobs'].append(log_prob.squeeze(0).cpu())  # (N,)
-        self.buffer['values'].append(value.squeeze(0).cpu())  # (1,)
+        # 存入 Buffer (存 CPU 张量)
+        self.buffer['uav_states'].append(torch.FloatTensor(state['uavs']))
+        self.buffer['target_states'].append(torch.FloatTensor(state['targets']))
+        self.buffer['edge_features'].append(torch.FloatTensor(state['edges']))
 
-        # 返回 Numpy 动作矩阵
-        return action.squeeze(0).cpu().numpy()
-
-    def predict(self, state):
-        """
-        推理模式 (Deterministic 建议用 argmax，这里暂时复用 get_action 采样)
-        后续可优化为输出 Logits 给匈牙利算法
-        """
-        uav_mat, tgt_mat = state
-        uav_t = torch.FloatTensor(uav_mat).unsqueeze(0).to(self.device)
-        tgt_t = torch.FloatTensor(tgt_mat).unsqueeze(0).to(self.device)
-
-        with torch.no_grad():
-            action, _, _, _ = self.policy.get_action(uav_t, tgt_t)
+        self.buffer['actions'].append(action.squeeze(0).cpu())
+        self.buffer['logprobs'].append(log_prob.squeeze(0).cpu())
+        self.buffer['values'].append(value.squeeze(0).cpu())
 
         return action.squeeze(0).cpu().numpy()
 
@@ -85,85 +61,96 @@ class PPOAgent:
         self.buffer['rewards'].append(reward)
         self.buffer['is_terminals'].append(done)
 
+    def _collate_batch(self, indices):
+        """
+        【关键】手动处理变长 3D 张量的 Padding
+        """
+        # 1. 提取数据
+        b_uavs = [self.buffer['uav_states'][i] for i in indices]
+        b_tgts = [self.buffer['target_states'][i] for i in indices]
+        b_edges = [self.buffer['edge_features'][i] for i in indices]
+        b_actions = [self.buffer['actions'][i] for i in indices]
+        b_logprobs = [self.buffer['logprobs'][i] for i in indices]
+
+        # 2. 计算最大维度
+        batch_size = len(indices)
+        max_n = max([u.shape[0] for u in b_uavs])
+        max_m = max([t.shape[0] for t in b_tgts])
+
+        # 3. 初始化全零 Padding 张量
+        # UAV: (B, Max_N, 7)
+        pad_uav = torch.zeros(batch_size, max_n, cfg.UAV_STATE_DIM).to(self.device)
+        # Tgt: (B, Max_M, 4)
+        pad_tgt = torch.zeros(batch_size, max_m, cfg.TARGET_STATE_DIM).to(self.device)
+        # Edge: (B, Max_N, Max_M, 2)
+        pad_edge = torch.zeros(batch_size, max_n, max_m, cfg.EDGE_DIM).to(self.device)
+
+        # Actions: (B, Max_N) -> 用 -1 填充，表示无效动作
+        pad_act = torch.full((batch_size, max_n), -1, dtype=torch.long).to(self.device)
+        pad_logprob = torch.zeros(batch_size, max_n).to(self.device)
+
+        # 4. 填入数据
+        for i in range(batch_size):
+            cur_n = b_uavs[i].shape[0]
+            cur_m = b_tgts[i].shape[0]
+
+            pad_uav[i, :cur_n, :] = b_uavs[i]
+            pad_tgt[i, :cur_m, :] = b_tgts[i]
+            pad_edge[i, :cur_n, :cur_m, :] = b_edges[i]
+            pad_act[i, :cur_n] = b_actions[i]
+            pad_logprob[i, :cur_n] = b_logprobs[i]
+
+        return pad_uav, pad_tgt, pad_edge, pad_act, pad_logprob
+
     def update(self):
-        # 1. 准备数据
         rewards = self.buffer['rewards']
-        # values 是 List of (1,) Tensor
-        values = torch.cat(self.buffer['values'], dim=0).to(self.device)  # (Buffer_Size,)
+        values = torch.cat(self.buffer['values'], dim=0).to(self.device)
 
-        # --- GAE 计算 (针对 One-Shot 简化版) ---
-        returns = []
-        tensor_rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device)
-        advantages = tensor_rewards - values.detach()
-        returns = tensor_rewards
-
-        # Normalize Advantages
+        # --- GAE (One-Shot 简化版) ---
+        # 因为 step=1 就结束，returns 就是 rewards
+        returns = torch.tensor(rewards, dtype=torch.float32).to(self.device)
+        advantages = returns - values.detach()
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-7)
 
-        # 2. 数据对齐与填充 (Padding)
-        # batch_first=True -> (Batch, Max_Len, Dim)
-        old_uav_states = pad_sequence(self.buffer['uav_states'], batch_first=True).to(self.device)
-        old_target_states = pad_sequence(self.buffer['target_states'], batch_first=True).to(self.device)
-        old_actions = pad_sequence(self.buffer['actions'], batch_first=True, padding_value=-1).to(
-            self.device)  # Pad with -1
-        old_logprobs = pad_sequence(self.buffer['logprobs'], batch_first=True).to(self.device)
-
-        # 3. PPO Update Loop
         dataset_size = len(rewards)
         batch_size = min(cfg.BATCH_SIZE, dataset_size)
 
-        sum_loss_actor = 0
-        sum_loss_critic = 0
-        sum_entropy = 0
-        update_count = 0
+        stats = {'loss_actor': 0, 'loss_critic': 0, 'entropy': 0}
 
         for _ in range(cfg.K_EPOCHS):
             sampler = BatchSampler(SubsetRandomSampler(range(dataset_size)), batch_size, drop_last=False)
 
             for indices in sampler:
-                indices = torch.tensor(indices, device=self.device)
+                # 使用自定义 Collate 函数获取 Padded Batch
+                b_uav, b_tgt, b_edge, b_act, b_old_logprob = self._collate_batch(indices)
 
-                # Slice Batch
-                b_uav = old_uav_states[indices]
-                b_tgt = old_target_states[indices]
-                b_act = old_actions[indices]  # (Batch, Max_N), contains -1
-                b_old_logprob = old_logprobs[indices]
                 b_adv = advantages[indices]
                 b_ret = returns[indices]
 
-                # ================= 修复核心 =================
-                # PyTorch 的 Categorical 不能处理 -1，即使我们后面会 Mask 掉。
-                # 所以我们创建一个 safe 的 action tensor，把 -1 替换成 0。
-                # 这样做不会影响结果，因为对应的 Loss 权重会被 mask 设为 0。
+                # 处理 Action 里的 -1 (Padding)
+                # 替换为 0 以防 gather 报错 (计算 Loss 时会被 Mask 掉)
                 b_act_safe = b_act.clone()
                 b_act_safe[b_act == -1] = 0
-                # ===========================================
 
-                # Evaluate (使用 safe actions)
-                logprobs, state_values, dist_entropy = self.policy.evaluate(b_uav, b_tgt, b_act_safe)
+                # Forward New Policy
+                # 传入 Edge Features
+                logprobs, state_values, dist_entropy = self.policy.evaluate(b_uav, b_tgt, b_edge, b_act_safe)
 
-                # State Value: (Batch, 1) -> (Batch,)
-                state_values = state_values.squeeze()
-
-                # Masking: 生成掩码，忽略 Padding 部分 (原始 b_act == -1 的位置)
+                # Masking (只计算真实 UAV 的 Loss)
                 mask = (b_act != -1).float()
 
-                # 聚合 LogProb: (Batch, Max_N) -> (Batch,)
-                # Sum log probability over all agents => Joint probability
+                # Joint LogProb Sum
                 action_logprobs_sum = (logprobs * mask).sum(dim=1)
                 old_logprobs_sum = (b_old_logprob * mask).sum(dim=1)
 
                 ratios = torch.exp(action_logprobs_sum - old_logprobs_sum)
 
-                # Surrogate Loss
                 surr1 = ratios * b_adv
                 surr2 = torch.clamp(ratios, 1 - cfg.EPS_CLIP, 1 + cfg.EPS_CLIP) * b_adv
                 loss_actor = -torch.min(surr1, surr2).mean()
 
-                # Critic Loss
-                loss_critic = self.mse_loss(state_values, b_ret)
+                loss_critic = self.mse_loss(state_values.squeeze(), b_ret)
 
-                # Entropy (Masked mean)
                 mean_entropy = (dist_entropy * mask).sum() / (mask.sum() + 1e-9)
 
                 loss = loss_actor + 0.5 * loss_critic - 0.01 * mean_entropy
@@ -173,20 +160,16 @@ class PPOAgent:
                 torch.nn.utils.clip_grad_norm_(self.policy.parameters(), cfg.GRAD_NORM_CLIP)
                 self.optimizer.step()
 
-                sum_loss_actor += loss_actor.item()
-                sum_loss_critic += loss_critic.item()
-                sum_entropy += mean_entropy.item()
-                update_count += 1
+                stats['loss_actor'] += loss_actor.item()
+                stats['loss_critic'] += loss_critic.item()
+                stats['entropy'] += mean_entropy.item()
 
         self.policy_old.load_state_dict(self.policy.state_dict())
         self.clear_buffer()
 
-        if update_count == 0: return None
-        return {
-            "loss_actor": sum_loss_actor / update_count,
-            "loss_critic": sum_loss_critic / update_count,
-            "entropy": sum_entropy / update_count
-        }
+        # Normalize stats
+        n_updates = cfg.K_EPOCHS * (dataset_size // batch_size + 1)
+        return {k: v / n_updates for k, v in stats.items()}
 
     def clear_buffer(self):
         for k in self.buffer:

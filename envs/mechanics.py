@@ -50,8 +50,8 @@ def calc_reward(uav, target, action):
     if needed > 0:
         # 【成功分配】
         # 奖励 = 基础分 + 角度加成 - 距离成本
-        return 10.0 + angle_reward + dist_penalty
+        return 1.0 + 0.1 * angle_reward + 0.1 * dist_penalty
     else:
         # 【无效分配】(不需要或已满)
         # 给予较大惩罚，教会它不要乱选
-        return -5.0
+        return -0.5

@@ -2,156 +2,177 @@
 import gym
 import numpy as np
 from gym import spaces
-from collections import deque
 from configs.config import cfg
 from envs.entities import UAV, Target
-from envs.mechanics import calc_reward, get_distance, calc_angle_score
 
 
 class UAVEnv(gym.Env):
     def __init__(self):
         super().__init__()
-        # 动作空间: 0 ~ N_targets (其中 N_targets 代表 Skip)
-        # 注意: 这里只定义维度，具体 range 在 step 中处理
         self.action_space = spaces.Discrete(cfg.ACTION_DIM)
 
-        # 观察空间: 变长 Dict
+        # 【Stage 3 新增】扩展观察空间
+        # 现在的 Obs 是一个包含节点和边信息的图
         self.observation_space = spaces.Dict({
+            # UAV 节点特征 (N, 7)
             "uavs": spaces.Box(low=-np.inf, high=np.inf, shape=(cfg.UAV_STATE_DIM,), dtype=np.float32),
-            "targets": spaces.Box(low=-np.inf, high=np.inf, shape=(cfg.TARGET_STATE_DIM,), dtype=np.float32)
+            # Target 节点特征 (M, 4)
+            "targets": spaces.Box(low=-np.inf, high=np.inf, shape=(cfg.TARGET_STATE_DIM,), dtype=np.float32),
+            # 边特征 (N, M, 2) -> (Distance, Heading_Cos)
+            "edges": spaces.Box(low=-np.inf, high=np.inf, shape=(cfg.EDGE_DIM,), dtype=np.float32)
         })
+
+        self.uavs = []
+        self.targets = []
 
     def reset(self, full_reset=True):
         if full_reset:
             scen = cfg.generate_scenario()
             self._init_scene(scen)
-        else:
-            self._reset_state_only()
         return self._get_obs()
 
     def _init_scene(self, scen):
         self.uavs = []
         self.targets = []
-        # 初始化 UAVs
+
+        # 初始化 UAVs (随机兵种)
         for i in range(scen['n_uavs']):
             pos = np.random.rand(2) * cfg.MAP_WIDTH
             angle = np.random.uniform(0, 2 * np.pi)
             vel = np.array([np.cos(angle), np.sin(angle)]) * 15.0
-            u_type = np.random.choice(scen['type_ids'])
+            u_type = np.random.choice([cfg.TYPE_DECOY, cfg.TYPE_STRIKE, cfg.TYPE_ASSESS])
+
             uav = UAV(id=i, pos=pos)
             uav.reset(pos, vel, u_type)
             self.uavs.append(uav)
+
         # 初始化 Targets
         for i in range(scen['n_targets']):
             pos = np.random.rand(2) * cfg.MAP_WIDTH
-            demands = {}
-            for t_id in scen['type_ids']:
-                demands[t_id] = np.random.randint(3, 4)
             tgt = Target(id=i, pos=pos)
-            tgt.reset(demands)
+            tgt.reset()
             self.targets.append(tgt)
 
-    def _reset_state_only(self):
-        pass
-
     def _get_obs(self):
-        # 1. UAV Matrix
-        uav_list = []
+        """
+        【Stage 3 核心】构建图数据
+        返回: Dict {'uavs': (N,7), 'targets': (M,4), 'edges': (N,M,2)}
+        """
+        # 1. UAV Matrix (N, 7)
+        uav_mat = []
         for u in self.uavs:
             norm_x = u.pos[0] / cfg.MAP_WIDTH
             norm_y = u.pos[1] / cfg.MAP_HEIGHT
-            norm_vx = u.velocity[0] / 15.0
-            norm_vy = u.velocity[1] / 15.0
-            u_type = float(u.uav_type)
-            avail = 1.0 if u.available else 0.0
-            uav_list.append([norm_x, norm_y, norm_vx, norm_vy, u_type, avail])
+            norm_vx = u.velocity[0] / 20.0
+            norm_vy = u.velocity[1] / 20.0
+            type_vec = [0, 0, 0]
+            type_vec[u.uav_type] = 1
+            uav_mat.append([norm_x, norm_y, norm_vx, norm_vy] + type_vec)
 
-        # 2. Target Matrix
-        target_list = []
+        # 2. Target Matrix (M, 4)
+        tgt_mat = []
         for t in self.targets:
             norm_x = t.pos[0] / cfg.MAP_WIDTH
             norm_y = t.pos[1] / cfg.MAP_HEIGHT
-            demands_vec = [0.0] * cfg.MAX_TYPES
-            for type_id, count in t.demands.items():
-                if type_id < cfg.MAX_TYPES:
-                    demands_vec[type_id] = float(count) / 10.0
-            target_list.append([norm_x, norm_y] + demands_vec)
+            norm_def = t.defense_level / 10.0
+            tgt_mat.append([norm_x, norm_y, t.value, norm_def])
 
-        return np.array(uav_list, dtype=np.float32), np.array(target_list, dtype=np.float32)
+        # 3. Edge Tensor (N, M, 2)
+        # 维度 0: Normalized Distance
+        # 维度 1: Heading Cosine (速度方向与连线的夹角余弦)
+        n_u = len(self.uavs)
+        n_t = len(self.targets)
+        edge_mat = np.zeros((n_u, n_t, cfg.EDGE_DIM), dtype=np.float32)
+
+        # 归一化系数 (地图对角线)
+        max_dist = cfg.MAP_WIDTH * 1.414
+
+        for i in range(n_u):
+            u = self.uavs[i]
+            for j in range(n_t):
+                t = self.targets[j]
+
+                # 相对位置向量
+                rel_pos = t.pos - u.pos
+                dist = np.linalg.norm(rel_pos)
+
+                # --- Feature 1: Distance ---
+                edge_mat[i, j, 0] = dist / max_dist
+
+                # --- Feature 2: Heading Alignment ---
+                # 计算 UAV速度向量 与 目标方向向量 的余弦相似度
+                # 1.0 = 正对目标飞, -1.0 = 背对目标飞
+                if dist > 1e-5 and np.linalg.norm(u.velocity) > 1e-5:
+                    # dot(a, b) / (|a| * |b|)
+                    cos_sim = np.dot(u.velocity, rel_pos) / (np.linalg.norm(u.velocity) * dist)
+                else:
+                    cos_sim = 0.0
+
+                edge_mat[i, j, 1] = cos_sim
+
+        return {
+            "uavs": np.array(uav_mat, dtype=np.float32),
+            "targets": np.array(tgt_mat, dtype=np.float32),
+            "edges": edge_mat
+        }
 
     def step(self, action):
         """
-        Step 5 重写: Global One-Shot Step
-        参数:
-            action: (N_uav,) 的整数数组，表示每个 UAV 选择了哪个 Target ID
-                    如果 action[i] == N_targets，表示 Skip
+        Stage 2 + 3: 逻辑保持不变，但返回值适配新的 obs 结构
         """
-        total_reward = 0
-        valid_assigns = 0
-        assigned_pairs = []
+        # --- 1. 统计分配 (Aggregation) ---
+        target_allocations = {j: {cfg.TYPE_DECOY: 0, cfg.TYPE_STRIKE: 0, cfg.TYPE_ASSESS: 0}
+                              for j in range(len(self.targets))}
 
-        n_targets = len(self.targets)
+        total_dist = 0.0
+        active_uav_count = 0
 
-        # 遍历每个 UAV 的决策
         for u_idx, t_idx in enumerate(action):
             uav = self.uavs[u_idx]
+            uav.assigned_target_id = t_idx
 
-            # 1. 判断是否 Skip
-            if t_idx == n_targets:
-                # Skip 只有微小惩罚或无惩罚
-                step_r = -0.1
-            else:
-                # 2. 尝试分配给 Target t_idx
-                # 越界保护 (虽然网络不应该输出越界)
-                if t_idx >= n_targets:
-                    step_r = -1.0  # Error penalty
-                else:
-                    target = self.targets[t_idx]
+            if t_idx == 0: continue  # Loiter
 
-                    # 检查距离 (为了计算分数)
-                    dist = get_distance(uav.pos, target.pos)
-                    dist_penalty = -0.001 * dist
-                    angle_score = calc_angle_score(uav.velocity, uav.pos, target.pos)
-                    angle_reward = 0.5 * angle_score
+            real_t_idx = t_idx - 1
+            if real_t_idx < len(self.targets):
+                target_allocations[real_t_idx][uav.uav_type] += 1
+                dist = np.linalg.norm(uav.pos - self.targets[real_t_idx].pos)
+                total_dist += dist
+                active_uav_count += 1
 
-                    # 检查供需
-                    needed, _ = target.get_demand_status(uav.uav_type)
+        # --- 2. 计算奖励 (Gate Logic) ---
+        mission_reward = 0.0
+        rho = 0.6
+        step_info_details = []
 
-                    if needed > 0:
-                        # === 成功分配 ===
-                        step_r = 10.0 + angle_reward + dist_penalty
-                        # 更新状态 (扣减需求)
-                        target.demands[uav.uav_type] -= 1
-                        target.assigned_counts[uav.uav_type] += 1
-                        uav.available = False
+        for j, counts in target_allocations.items():
+            tgt = self.targets[j]
+            n_d, n_s, n_a = counts[cfg.TYPE_DECOY], counts[cfg.TYPE_STRIKE], counts[cfg.TYPE_ASSESS]
 
-                        valid_assigns += 1
-                        assigned_pairs.append((u_idx, t_idx))
-                    else:
-                        # === 无效分配 (不需要或已满) ===
-                        step_r = -5.0  # 惩罚乱选
+            d_val = max(1.0, tgt.defense_level)
+            p_pen = min(1.0, n_d / d_val)  # 突防
+            p_dmg = 1.0 - (1.0 - rho) ** n_s  # 毁伤
+            i_info = 1.0 if n_a >= 1 else 0.0  # 闭环
 
-            total_reward += step_r
+            task_r = tgt.value * p_pen * p_dmg * i_info * 10.0
+            mission_reward += task_r
 
-        # 计算满足率
-        total_needed = 0
-        total_filled = 0
-        for t in self.targets:
-            total_needed += (sum(t.demands.values()) + sum(t.assigned_counts.values()))
-            total_filled += sum(t.assigned_counts.values())
+            step_info_details.append({"tgt_id": j, "alloc": counts, "reward": task_r})
 
-        sat_rate = total_filled / total_needed if total_needed > 0 else 0.0
+        # --- 3. 移动惩罚 ---
+        dist_penalty = 0.0
+        if active_uav_count > 0:
+            avg_dist = total_dist / active_uav_count
+            dist_penalty = (avg_dist / (cfg.MAP_WIDTH * 1.414)) * 1.0
 
-        info = {
-            "valid_assigns": valid_assigns,
-            "sat_rate": sat_rate,
-            "assigned_pairs": assigned_pairs
-        }
-
-        # One-Shot 任务，一步即结束
+        total_reward = mission_reward - dist_penalty
         done = True
 
-        # 返回 next_obs (对于 One-Shot 其实没用，但为了兼容性返回当前状态)
-        next_obs = self._get_obs()
+        info = {
+            "mission_reward": mission_reward,
+            "dist_penalty": dist_penalty,
+            "details": step_info_details,
+            "sat_rate": 0.0  # 占位
+        }
 
-        return next_obs, total_reward, done, info
+        return self._get_obs(), total_reward, done, info

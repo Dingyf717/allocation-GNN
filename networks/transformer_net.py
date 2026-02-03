@@ -8,10 +8,9 @@ from configs.config import cfg
 
 class DeepAllocationNet(nn.Module):
     """
-    Step 3: Deep Scheme 核心网络
-    架构: Encoder (Self-Attention) -> Decoder (Cross-Attention)
-    输入: 全局 UAV 状态矩阵, 全局 Target 状态矩阵
-    输出: 全局分配概率矩阵 (Batch, N_uav, N_target + 1)
+    Stage 4 (Fixed): Edge-Aware Graph Transformer
+    架构: Node Encoder + Edge Encoder -> Edge-Injected Cross-Attention
+    修复: Critic 现在也会聚合 Edge 特征，从而感知几何结构(距离/角度)
     """
 
     def __init__(self):
@@ -20,126 +19,117 @@ class DeepAllocationNet(nn.Module):
         self.embed_dim = cfg.EMBED_DIM
 
         # ================= 1. Encoders =================
-        # UAV 特征提取: Linear -> Transformer Encoder (交互)
+        # UAV Node Encoder
         self.uav_embedding = nn.Sequential(
             nn.Linear(cfg.UAV_STATE_DIM, self.embed_dim),
             nn.LayerNorm(self.embed_dim),
             nn.ReLU()
         )
-        # Self-Attention 层: 解决短视问题的核心，让 UAV 互相通信
-        self.uav_encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.embed_dim,
-            nhead=cfg.NUM_HEADS,
-            batch_first=True,
-            dim_feedforward=256
+        # Self-Attention (UAVs 协作)
+        self.uav_encoder = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=self.embed_dim, nhead=cfg.NUM_HEADS, batch_first=True),
+            num_layers=cfg.NUM_LAYERS
         )
-        self.uav_encoder = nn.TransformerEncoder(self.uav_encoder_layer, num_layers=cfg.NUM_LAYERS)
 
-        # Target 特征提取
+        # Target Node Encoder
         self.target_embedding = nn.Sequential(
             nn.Linear(cfg.TARGET_STATE_DIM, self.embed_dim),
             nn.LayerNorm(self.embed_dim),
             nn.ReLU()
         )
 
-        # ================= 2. Decoder (Policy Head) =================
-        # 这是一个可学习的“Skip”向量，代表“不分配/跳过”这个选项
-        # 形状: (1, 1, Embed_Dim)
+        # Edge Encoder
+        self.edge_embedding = nn.Sequential(
+            nn.Linear(cfg.EDGE_DIM, self.embed_dim),
+            nn.LayerNorm(self.embed_dim),
+            nn.ReLU()
+        )
+        # Edge Bias Projector
+        self.edge_gate = nn.Linear(self.embed_dim, 1)
+
+        # ================= 2. Decoder =================
+        # Loiter Token
         self.skip_token = nn.Parameter(torch.randn(1, 1, self.embed_dim))
 
-        self.scale = self.embed_dim ** -0.5  # 缩放因子
+        self.scale = self.embed_dim ** -0.5
 
-        # ================= 3. Critic Head =================
-        # 评估全局状态价值 V(s)
+        # ================= 3. Critic =================
         self.critic_head = nn.Sequential(
             nn.Linear(self.embed_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 1)
         )
 
-    def forward(self):
-        raise NotImplementedError("Use get_action or evaluate.")
-
-    def _encode_global_state(self, uav_states, target_states):
+    def get_action(self, uav_states, target_states, edge_features, action=None):
         """
-        前向传播公共部分：编码特征
-        """
-        # uav_states: (Batch, N, U_dim)
-        # target_states: (Batch, M, T_dim)
-
-        # 1. Encode UAVs (With Interaction)
-        u_emb = self.uav_embedding(uav_states)  # -> (Batch, N, E)
-        u_emb = self.uav_encoder(u_emb)  # -> (Batch, N, E) [Self-Attention happens here]
-
-        # 2. Encode Targets
-        t_emb = self.target_embedding(target_states)  # -> (Batch, M, E)
-
-        return u_emb, t_emb
-
-    def get_action(self, uav_states, target_states, action=None):
-        """
-        计算动作概率与价值
         参数:
-            uav_states: (Batch, N_uav, U_dim)
-            target_states: (Batch, N_tgt, T_dim)
-            action: (Batch, N_uav) Optional, 用于 evaluate 模式
-        返回:
-            action, log_prob, value, entropy
+            uav_states: (Batch, N, 7)
+            target_states: (Batch, M, 4)
+            edge_features: (Batch, N, M, 2)
         """
-        # 1. 提取特征
-        u_emb, t_emb = self._encode_global_state(uav_states, target_states)
-        batch_size, n_uav, _ = u_emb.shape
-        batch_size, n_tgt, _ = t_emb.shape
+        batch_size, n_uav, _ = uav_states.shape
+        _, n_tgt, _ = target_states.shape
 
-        # 2. 构建 Key 集合 (Targets + Skip Token)
-        # 我们把 Skip Token 复制 Batch 份
-        skip_emb = self.skip_token.expand(batch_size, 1, -1)  # (B, 1, E)
+        # 1. Node Encoding
+        u_emb = self.uav_embedding(uav_states)  # (B, N, E)
+        u_emb = self.uav_encoder(u_emb)  # (B, N, E)
 
-        # Keys: [Target_0, Target_1, ..., Target_M-1, Skip]
-        # Shape: (B, M+1, E)
-        keys = torch.cat([t_emb, skip_emb], dim=1)
+        t_emb = self.target_embedding(target_states)  # (B, M, E)
 
-        # 3. 计算 Logits (Cross-Attention)
-        # Query = UAVs (B, N, E)
-        # Key   = Targets+Skip (B, M+1, E)
-        # Logits = Q * K^T
-        # Shape: (B, N, M+1)
-        logits = torch.matmul(u_emb, keys.transpose(1, 2)) * self.scale
+        # 2. Edge Encoding & Bias
+        # e_emb: (B, N, M, E)
+        e_emb = self.edge_embedding(edge_features)
 
-        # 4. 动作采样 / 概率计算
-        # 我们把每个 UAV 视为独立的决策者 (Joint Independent Policy)
-        # Flatten 用于构建分布: (B*N, M+1)
+        # Calculate Bias for Actor: (B, N, M)
+        edge_bias = self.edge_gate(e_emb).squeeze(-1)
+
+        # 3. Cross Attention with Edge Injection (Actor Logic)
+        # Part A: UAVs -> Real Targets
+        logits_tgt = torch.matmul(u_emb, t_emb.transpose(1, 2)) * self.scale
+        # 【核心】注入物理约束
+        logits_tgt = logits_tgt + edge_bias
+
+        # Part B: UAVs -> Loiter
+        skip_emb = self.skip_token.expand(batch_size, 1, -1)
+        logits_skip = torch.matmul(u_emb, skip_emb.transpose(1, 2)) * self.scale
+
+        # Output Logits
+        logits = torch.cat([logits_skip, logits_tgt], dim=2)
+
+        # 4. Action Distribution
         logits_flat = logits.reshape(-1, n_tgt + 1)
         dist = Categorical(logits=logits_flat)
 
         if action is None:
-            # 采样动作
-            action_flat = dist.sample()  # (B*N,)
+            action_flat = dist.sample()
             action = action_flat.view(batch_size, n_uav)
         else:
-            # 使用传入的动作 (用于 Update 阶段)
             action_flat = action.view(-1)
 
         log_prob_flat = dist.log_prob(action_flat)
         entropy_flat = dist.entropy()
 
-        # 还原形状
-        log_prob = log_prob_flat.view(batch_size, n_uav)  # (B, N)
-        entropy = entropy_flat.view(batch_size, n_uav)  # (B, N)
+        log_prob = log_prob_flat.view(batch_size, n_uav)
+        entropy = entropy_flat.view(batch_size, n_uav)
 
-        # 5. Critic Value Calculation
-        # 使用 Global Max Pooling 聚合所有 UAV 和 Target 的信息
-        # 这样 Critic 能看到全局信息
+        # 5. Critic Value (Fixed: Geometry-Aware)
+        # 聚合 UAV 特征
         g_u = torch.max(u_emb, dim=1)[0]  # (B, E)
+        # 聚合 Target 特征
         g_t = torch.max(t_emb, dim=1)[0]  # (B, E)
 
-        global_feat = g_u + g_t  # (B, E)简单融合
+        # 【修复】聚合 Edge 特征
+        # e_emb 是 (B, N, M, E)。我们需要将其展平并池化，以提取"全局几何特征"
+        # 例如：如果在 N*M 条边中有一条边特征很好（距离极近），Critic 应该能感知到
+        g_e = torch.max(e_emb.flatten(1, 2), dim=1)[0]  # (B, E)
+
+        # 简单融合
+        global_feat = g_u + g_t + g_e
+
         value = self.critic_head(global_feat)  # (B, 1)
 
         return action, log_prob, value, entropy
 
-    def evaluate(self, uav_states, target_states, action):
-        """兼容 PPO update 接口"""
-        # 复用 get_action 逻辑，只是不需要返回 action
-        _, log_prob, value, entropy = self.get_action(uav_states, target_states, action)
+    def evaluate(self, uav_states, target_states, edge_features, action):
+        _, log_prob, value, entropy = self.get_action(uav_states, target_states, edge_features, action)
         return log_prob, value, entropy

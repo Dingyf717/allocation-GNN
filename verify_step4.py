@@ -1,46 +1,68 @@
-# verify_step4.py
+import torch
 import numpy as np
-from envs.uav_env import UAVEnv
-from agents.ppo import PPOAgent
+from configs.config import cfg
+from networks.transformer_net import DeepAllocationNet
 
 
-def verify_agent():
-    print("=== Step 4 Verification: Agent & Data Flow ===")
+def verify_network_upgrade():
+    print("================ 阶段四：神经网络升级验证 ================")
 
-    env = UAVEnv()
-    agent = PPOAgent()
+    # 1. 实例化网络
+    net = DeepAllocationNet()
+    print("✅ 网络实例化成功")
+    print(f"   Embed Dim: {net.embed_dim}")
+    print(f"   Input Dims: UAV={cfg.UAV_STATE_DIM}, Tgt={cfg.TARGET_STATE_DIM}, Edge={cfg.EDGE_DIM}")
 
-    # 1. 获取一个状态
-    state = env.reset()
-    print("State Shapes:", state[0].shape, state[1].shape)
+    # 2. 构造 Mock 数据 (Batch=2, N=10, M=5)
+    B, N, M = 2, 10, 5
+    print(f"\n[Input Shapes] Batch={B}, N_uav={N}, N_tgt={M}")
 
-    # 2. Select Action
-    action = agent.select_action(state)
-    print("\nSelected Action:")
-    print(f"  Shape: {action.shape} (Should be N_uav,)")
-    print(f"  Example: {action[:10]}")
+    uav_states = torch.randn(B, N, cfg.UAV_STATE_DIM)
+    tgt_states = torch.randn(B, M, cfg.TARGET_STATE_DIM)
+    edge_feats = torch.randn(B, N, M, cfg.EDGE_DIM)
 
-    # 3. Store Transition
-    agent.store_transition(reward=10.0, done=True)
+    print(f"   UAV Tensor: {uav_states.shape}")
+    print(f"   Tgt Tensor: {tgt_states.shape}")
+    print(f"   Edge Tensor:{edge_feats.shape}")
 
-    # 4. Mock Update (Force run)
-    # 再存几个 dummy 数据，确保存储不够 BatchSize 也能跑 (代码里有 min 处理)
-    for _ in range(5):
-        s = env.reset()  # 注意：reset 可能会改变 N_uav，用于测试 Padding
-        a = agent.select_action(s)
-        agent.store_transition(reward=5.0, done=True)
-
-    print("\nRunning Update (with variable lengths)...")
+    # 3. 前向传播测试
     try:
-        stats = agent.update()
-        print("Update Success!")
-        print("Stats:", stats)
-        print("\n✅ PPO Agent 逻辑验证通过！One-Shot 变长 Batch 跑通。")
+        action, log_prob, value, entropy = net.get_action(uav_states, tgt_states, edge_feats)
+
+        print("\n[Output Shapes]")
+        print(f"   Action:   {action.shape}   Expect: ({B}, {N})")
+        print(f"   LogProb:  {log_prob.shape}  Expect: ({B}, {N})")
+        print(f"   Value:    {value.shape}     Expect: ({B}, 1)")
+        print(f"   Entropy:  {entropy.shape}   Expect: ({B}, {N})")
+
+        # 4. 验证动作范围
+        # 动作应该是 0 ~ M (共 M+1 个选项)
+        max_act = action.max().item()
+        min_act = action.min().item()
+        print(f"\n[Logic Check]")
+        print(f"   Max Action Index: {max_act} (Should be <= {M})")
+        print(f"   Min Action Index: {min_act} (Should be >= 0)")
+
+        if max_act <= M and min_act >= 0:
+            print("✅ 动作索引范围正确")
+        else:
+            print("❌ 动作索引越界")
+
+        # 5. 验证 Edge Injection (梯度检查)
+        # 我们需要确认 edge_feats 参与了计算（即有梯度）
+        edge_feats.requires_grad = True
+        _, _, v, _ = net.get_action(uav_states, tgt_states, edge_feats)
+        v.mean().backward()
+        if edge_feats.grad is not None and edge_feats.grad.abs().sum() > 0:
+            print("✅ Edge Features 梯度回传正常 (物理约束已生效)")
+        else:
+            print("❌ Edge Features 梯度为零 (物理约束未接入)")
+
     except Exception as e:
-        print("\n❌ Update Failed.")
+        print(f"\n❌ 前向传播失败: {e}")
         import traceback
         traceback.print_exc()
 
 
 if __name__ == "__main__":
-    verify_agent()
+    verify_network_upgrade()
